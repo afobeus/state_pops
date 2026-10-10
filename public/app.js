@@ -1,10 +1,11 @@
-import { createGame, step, dispatch, recordResult, DEFAULT_PROFILE, validateSave, TOTAL_LEVELS, COLORS, MAPS, mapInfo, random } from './engine.js';
+import { createGame, step, dispatch, recordResult, DEFAULT_PROFILE, validateSave, TOTAL_LEVELS, COLORS, MAPS, mapInfo, random, TRAVEL_SPEED, SOLDIER_RADIUS, fleetPosition, aiTuning } from './engine.js';
 
 const $ = id => document.getElementById(id);
 const icon = name => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
 const escape = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const titles = ['Первые рубежи', 'Встречный ветер', 'Три берега', 'Перекрёсток', 'Линия фронта', 'За горизонтом', 'Четвёртая сила', 'Тихая гавань', 'Остров надежды', 'Точка опоры', 'Большой переход', 'Новый рубеж', 'Дальний восток', 'Союз островов', 'Земли рассвета', 'Высокая ставка', 'Золотой берег', 'В сердце карты', 'Последний бастион', 'Обратный отсчёт', 'Сила империи', 'Решающая битва', 'Все пути', 'Твоя империя'];
-const chapters = ['Начало пути', 'Новые горизонты', 'Время империи', 'Последний рубеж'];
+const chapters = ['Начало пути', 'Новые горизонты', 'Время империи', 'Большая стратегия', 'Опасные соседи', 'Битва за материк', 'Полководцы', 'Железная воля', 'На пределе', 'Последний рубеж'];
+const levelTitle = level => titles[level - 1] || MAPS[(level - 1) % MAPS.length].name;
 let profile = DEFAULT_PROFILE(), game = createGame(), user = null;
 let version = 0, updatedAt = null, dirty = false, revision = 0, saving = null, conflict = false, authUnknown = false, accountReady = false, syncError = false;
 let selected = [], portrait = matchMedia('(max-width:650px)').matches, dragging = null, suppressClick = false;
@@ -121,8 +122,8 @@ function buildMap() {
   const w = portrait ? 590 : 920, h = portrait ? 780 : 370;
   $('map').setAttribute('viewBox', `0 0 ${w} ${h}`);
   const rect = $('map').querySelector('rect'); rect.setAttribute('width', w); rect.setAttribute('height', h);
-  const info = mapInfo(game), islands = game.mapVersion === 2 && ['islands', 'stars'].includes(info.kind);
-  const outline = (game.mapVersion === 2 ? info.outline : [[45,95],[120,42],[420,38],[620,60],[725,156],[735,405],[658,524],[440,547],[135,530],[42,418],[30,223]]).map(([x,y]) => { const p = projected({x,y}); return [p.x,p.y]; });
+  const info = mapInfo(game), islands = game.mapVersion >= 2 && ['islands', 'stars'].includes(info.kind);
+  const outline = (game.mapVersion >= 2 ? info.outline : [[45,95],[120,42],[420,38],[620,60],[725,156],[735,405],[658,524],[440,547],[135,530],[42,418],[30,223]]).map(([x,y]) => { const p = projected({x,y}); return [p.x,p.y]; });
   fleetElements.clear(); $('fleetLayer').replaceChildren();
   refs = [];
   $('terrain').innerHTML = game.nodes.map((n, i) => {
@@ -157,20 +158,16 @@ function renderMap() {
   }
 }
 function animateFleets(now) {
-  const present = new Set(), extrapolation = multiplayer?.state === 'playing' && multiplayer.connected ? Math.min(.18, (now - snapshotTime) / 1000) : 0;
+  const present = new Set(), extrapolation = multiplayer?.state === 'playing' && multiplayer.connected ? Math.min(.1, (now - snapshotTime) / 1000) : 0;
   for (const f of game.fleets) {
-    const from = projected(game.nodes[f.from]), to = projected(game.nodes[f.to]);
-    const dx = to.x - from.x, dy = to.y - from.y, distance = Math.hypot(dx,dy);
     for (let j = 0; j < f.units; j++) {
       const key = `${f.id}:${j}`; present.add(key);
       let el = fleetElements.get(key);
-      if (!el) { el = document.createElementNS(SVG_NS, 'circle'); el.setAttribute('r', '3.2'); el.setAttribute('fill', COLORS[f.owner]); el.setAttribute('class', 'fleet-dot'); $('fleetLayer').append(el); fleetElements.set(key, el); }
+      if (!el) { el = document.createElementNS(SVG_NS, 'circle'); el.setAttribute('r', String(SOLDIER_RADIUS)); el.setAttribute('fill', COLORS[f.owner]); el.setAttribute('class', 'fleet-dot'); $('fleetLayer').append(el); fleetElements.set(key, el); }
       const t = Math.max(0, Math.min(1, f.progress + extrapolation / f.duration - j * .004));
-      const lane = ((f.id + j) % 4 - 1.5) * 6;
-      const bend = Math.pow(Math.sin(Math.PI * t), .3) * lane;
-      const margin = Math.min(.3, 26 / distance), along = margin + t * (1 - margin * 2);
-      el.setAttribute('cx', (from.x + dx * along - dy / distance * bend).toFixed(2));
-      el.setAttribute('cy', (from.y + dy * along + dx / distance * bend).toFixed(2));
+      const point = projected(fleetPosition(game, f, f.progress + extrapolation / f.duration, j));
+      el.setAttribute('cx', point.x.toFixed(2));
+      el.setAttribute('cy', point.y.toFixed(2));
       el.setAttribute('opacity', Math.min(1, t * 24, (1 - t) * 24).toFixed(2));
     }
   }
@@ -178,12 +175,13 @@ function animateFleets(now) {
 }
 function formatTime(seconds) { return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`; }
 function render() {
-  const level = game.level, chapter = Math.floor((level - 1) / 6);
+  const level = game.level, chapter = Math.floor((level - 1) / 100);
   $('levelChip').textContent = String(level).padStart(2, '0');
-  $('levelName').textContent = titles[level - 1]; $('levelSubtitle').textContent = `Глава ${chapter + 1} · ${chapters[chapter]}`;
+  $('levelChip').classList.toggle('long-level', level >= 100);
+  $('levelName').textContent = levelTitle(level); $('levelSubtitle').textContent = `Бот: ${aiTuning(level, game.difficulty).label} · глава ${chapter + 1}`;
   $('operationNumber').textContent = String(level).padStart(2, '0');
   $('chapterNumber').textContent = String(chapter + 1).padStart(2, '0'); $('chapterTitle').textContent = chapters[chapter];
-  $('chapterDescription').textContent = ['Даже большая империя начинается с маленькой территории.', 'Новые земли, новые соперники. Твоя стратегия становится сильнее.', 'Четыре армии. Одна карта. Время сделать решающий ход.', 'Впереди самые сложные битвы. Победа уже близко.'][chapter];
+  $('chapterDescription').textContent = level <= 10 ? 'Соперник учится: медлит, ошибается и оставляет время на первый захват.' : level >= 900 ? 'Боты действуют сообща, быстро реагируют и имеют огромное преимущество в армии.' : 'С каждым уровнем соперники быстрее реагируют, точнее выбирают цели и лучше защищают свои земли.';
   const completed = Object.keys(profile.best).length;
   $('campaignProgress').textContent = `${completed} / ${TOTAL_LEVELS}`; $('progressFill').style.width = `${completed / TOTAL_LEVELS * 100}%`;
   $('timer').textContent = formatTime(game.time);
@@ -191,7 +189,7 @@ function render() {
   const mine = game.nodes.filter(n => n.owner === myOwner());
   $('territoryCount').textContent = mine.length; $('territoryTotal').textContent = ` / ${game.nodes.length}`;
   $('armyCount').textContent = Math.floor(mine.reduce((s, n) => s + n.units, 0) + game.fleets.filter(f => f.owner === myOwner()).reduce((s, f) => s + f.units, 0));
-  $('winsCount').textContent = profile.wins; $('purpleKey').hidden = game.level <= 6;
+  $('winsCount').textContent = profile.wins; $('purpleKey').hidden = !game.nodes.some(n => n.owner === 3);
   const distribution = Array.from({ length: 5 }, (_, i) => game.nodes.filter(n => n.owner === i - 1).length);
   $('factionBar').innerHTML = distribution.map((n, i) => `<span style="width:${n / game.nodes.length * 100}%;background:${i ? COLORS[i - 1] : '#d5dfd5'}"></span>`).join('');
   const states = { ready: 'ПОДГОТОВКА', playing: 'В БОЮ', paused: 'ПАУЗА', won: 'ПОБЕДА', lost: 'ПОРАЖЕНИЕ' };
@@ -313,14 +311,14 @@ function openAccount() {
   if (!user || authUnknown) return openAuth();
   openModal('account', `<h2 class="modal-title">Привет, ${escape(user.name)}.</h2><p class="modal-description">${escape(user.email)}<br>Войди в этот аккаунт по тому же адресу игры на другом устройстве, чтобы продолжить кампанию.</p><div class="account-summary"><div><span>Пройдено уровней</span><strong>${Object.keys(profile.best).length} / ${TOTAL_LEVELS}</strong></div><div><span>Последняя синхронизация</span><strong class="autosave-time">${updatedAt ? escape(new Date(updatedAt).toLocaleString('ru-RU')) : 'Ещё не сохранено'}</strong></div><div><span>Состояние</span><strong>${conflict ? 'Нужно выбрать версию' : dirty ? 'Ожидает синхронизации' : 'Сохранено в аккаунте'}</strong></div></div><div class="button-stack"><button class="primary-button" data-action="sync">${icon('cloud')} Синхронизировать сейчас</button><button class="secondary-button" data-action="reload-cloud">Загрузить с другого устройства</button></div><button class="danger-button" data-action="logout">Выйти из аккаунта</button>`, 'STATE.IO / ПРОФИЛЬ');
 }
-function openCampaign() {
+function openCampaign(page = Math.floor((game.level - 1) / 25)) {
   if (multiplayer) return openRoom();
-  let html = '<h2 class="modal-title">Твоя карта побед.</h2><p class="modal-description">24 операции. Четыре главы. Одна империя.<br>Победи всех соперников, чтобы открыть следующий уровень.</p>';
-  for (let chapter = 0; chapter < 4; chapter++) {
-    html += `<h3 class="chapter-heading">0${chapter + 1} / ${chapters[chapter]}</h3><div class="campaign-grid">`;
-    for (let i = chapter * 6 + 1; i <= (chapter + 1) * 6; i++) html += `<button class="level-button ${game.level === i ? 'current' : profile.best[i] !== undefined ? 'completed' : ''}" data-level="${i}" ${i > profile.unlocked ? 'disabled' : ''} aria-label="Уровень ${i}: ${titles[i - 1]}${i > profile.unlocked ? ', закрыт' : ''}" title="${titles[i - 1]}${profile.best[i] !== undefined ? ` · лучшее время ${formatTime(profile.best[i])}` : ''}">${i > profile.unlocked ? icon('lock') : String(i).padStart(2, '0')}${profile.best[i] !== undefined ? '<span class="mini-star">★</span>' : ''}</button>`;
-    html += '</div>';
-  }
+  const pages = Math.ceil(TOTAL_LEVELS / 25);
+  page = Math.max(0, Math.min(pages - 1, page));
+  const first = page * 25 + 1, last = Math.min(TOTAL_LEVELS, first + 24), chapter = Math.floor((first - 1) / 100);
+  let html = `<h2 class="modal-title">Твоя карта побед.</h2><p class="modal-description">${TOTAL_LEVELS} операций. Соперники растут вместе с тобой.<br>Победи всех ботов, чтобы открыть следующий уровень.</p><label class="form-field">Перейти к уровням<select id="campaignPage">${Array.from({length:pages},(_,p) => `<option value="${p}" ${p === page ? 'selected' : ''}>${p * 25 + 1}–${Math.min(TOTAL_LEVELS, p * 25 + 25)}</option>`).join('')}</select></label><h3 class="chapter-heading">${String(chapter + 1).padStart(2,'0')} / ${chapters[chapter]}</h3><div class="campaign-grid campaign-page">`;
+  for (let i = first; i <= last; i++) html += `<button class="level-button ${game.level === i ? 'current' : profile.best[i] !== undefined ? 'completed' : ''}" data-level="${i}" ${i > profile.unlocked ? 'disabled' : ''} aria-label="Уровень ${i}: ${levelTitle(i)}${i > profile.unlocked ? ', закрыт' : ''}" title="${levelTitle(i)}${profile.best[i] !== undefined ? ` · лучшее время ${formatTime(profile.best[i])}` : ''}">${i > profile.unlocked ? icon('lock') : String(i).padStart(2,'0')}${profile.best[i] !== undefined ? '<span class="mini-star">★</span>' : ''}</button>`;
+  html += `</div><div class="campaign-pagination"><button class="secondary-button" data-action="campaign-page" data-page="${page - 1}" ${page === 0 ? 'disabled' : ''} aria-label="Предыдущие 25 уровней">←</button><span>${first}–${last}</span><button class="secondary-button" data-action="campaign-page" data-page="${page + 1}" ${page === pages - 1 ? 'disabled' : ''} aria-label="Следующие 25 уровней">→</button></div><button class="secondary-button full-width campaign-current" data-action="campaign">К текущему уровню ${game.level}</button>`;
   html += '<p class="help-foot">Выбор другого уровня заменит текущую партию. Повторное прохождение улучшает личное время.</p>';
   openModal('campaign', html, 'STATE.IO / КАМПАНИЯ');
 }
@@ -330,15 +328,16 @@ function openAchievements() {
     ['Исследователь', 'Пройди первые шесть операций', profile.unlocked >= 7, 'map'],
     ['Большая стратегия', 'Пройди двенадцать операций', profile.unlocked >= 13, 'game'],
     ['Молниеносный захват', 'Заверши любую операцию менее чем за 2 минуты', Object.values(profile.best).some(n => n < 120), 'spark'],
-    ['Повелитель карты', 'Пройди все 24 операции', profile.best[24] !== undefined, 'cup']
+    ['Полководец', 'Выиграй на 100-м уровне', profile.best[100] !== undefined, 'game'],
+    ['Повелитель карты', `Пройди все ${TOTAL_LEVELS} операций`, Object.keys(profile.best).length === TOTAL_LEVELS, 'cup']
   ];
   openModal('achievements', `<h2 class="modal-title">Каждая победа — история.</h2><p class="modal-description">Твои достижения в кампании. Продолжай играть, чтобы собрать их все.</p><div class="achievement-list">${achievements.map(([name, description, done, symbol]) => `<div class="achievement ${done ? 'unlocked' : ''}"><div class="medal">${icon(symbol)}</div><div><h3>${name}</h3><p>${description}</p></div><span>${done ? 'Получено' : icon('lock')}</span></div>`).join('')}</div>`, 'STATE.IO / ДОСТИЖЕНИЯ');
 }
 function openSettings() {
-  openModal('settings', `<h2 class="modal-title">Твой стиль игры.</h2><p class="modal-description">Настройки сохраняются вместе с кампанией.</p><label class="form-field">Сложность новых партий<select id="difficultySetting"><option value="easy" ${profile.settings.difficulty === 'easy' ? 'selected' : ''}>Лёгкая — время подумать</option><option value="normal" ${profile.settings.difficulty === 'normal' ? 'selected' : ''}>Обычная — равные силы</option><option value="hard" ${profile.settings.difficulty === 'hard' ? 'selected' : ''}>Сложная — быстрые соперники</option></select></label><div class="setting-row"><div><h3>Звуковые сигналы</h3><p>Отправка отрядов и победы</p></div><label class="toggle"><input id="soundSetting" type="checkbox" aria-label="Звуковые сигналы" ${profile.settings.sound ? 'checked' : ''}><span></span></label></div><div class="setting-row"><div><h3>Меньше анимации</h3><p>Отключить декоративные переходы</p></div><label class="toggle"><input id="motionSetting" type="checkbox" aria-label="Меньше анимации" ${profile.settings.reducedMotion ? 'checked' : ''}><span></span></label></div><p class="form-note">Изменение сложности применяется при запуске нового уровня.<br>Партия автоматически ставится на паузу, если ты уходишь с вкладки.</p><button class="primary-button full-width" data-action="save-settings">Сохранить настройки ${icon('check')}</button>`, 'STATE.IO / НАСТРОЙКИ');
+  openModal('settings', `<h2 class="modal-title">Твой стиль игры.</h2><p class="modal-description">Настройки сохраняются вместе с кампанией.</p><label class="form-field">Сложность новых партий<select id="difficultySetting"><option value="easy" ${profile.settings.difficulty === 'easy' ? 'selected' : ''}>Лёгкая — время подумать</option><option value="normal" ${profile.settings.difficulty === 'normal' ? 'selected' : ''}>Обычная — сложность по уровню</option><option value="hard" ${profile.settings.difficulty === 'hard' ? 'selected' : ''}>Сложная — быстрые соперники</option></select></label><div class="setting-row"><div><h3>Звуковые сигналы</h3><p>Отправка отрядов и победы</p></div><label class="toggle"><input id="soundSetting" type="checkbox" aria-label="Звуковые сигналы" ${profile.settings.sound ? 'checked' : ''}><span></span></label></div><div class="setting-row"><div><h3>Меньше анимации</h3><p>Отключить декоративные переходы</p></div><label class="toggle"><input id="motionSetting" type="checkbox" aria-label="Меньше анимации" ${profile.settings.reducedMotion ? 'checked' : ''}><span></span></label></div><p class="form-note">Изменение сложности применяется при запуске нового уровня.<br>Партия автоматически ставится на паузу, если ты уходишь с вкладки.</p><button class="primary-button full-width" data-action="save-settings">Сохранить настройки ${icon('check')}</button>`, 'STATE.IO / НАСТРОЙКИ');
 }
 function openHelp() {
-  openModal('help', `<h2 class="modal-title">Думай на шаг вперёд.</h2><p class="modal-description">Простое управление. Безграничная стратегия.</p><ol class="help-list"><li><h3>Собери свою армию</h3><p>На синих территориях автоматически появляются новые бойцы. Число в круге — размер гарнизона.</p></li><li><h3>Выбери цель</h3><p>Нажми на свою территорию, затем на цель. Или перетащи отряд от своей базы к другой земле. Всегда отправляется 100% текущего гарнизона: по четыре бойца каждые 0,1 секунды. Новые бойцы остаются на базе.</p></li><li><h3>Расширяй границы</h3><p>Каждый шарик — отдельный боец. Бойцы захватывают землю постепенно, уменьшая гарнизон при каждом прибытии. На свои земли можно отправлять подкрепления. Серые земли не наращивают армию.</p></li><li><h3>Захвати всю карту</h3><p>Победи все армии соперников и открой следующую операцию. Пока у соперника есть отряды в пути, битва продолжается.</p></li></ol><div class="help-foot">Компьютер: Shift + нажатие выбирает несколько баз. Enter или пробел активируют территорию с клавиатуры. Пробел вне карты ставит игру на паузу. На телефоне работают нажатия и перетаскивание.</div>`, 'STATE.IO / КАК ИГРАТЬ');
+  openModal('help', `<h2 class="modal-title">Думай на шаг вперёд.</h2><p class="modal-description">Простое управление. Безграничная стратегия.</p><ol class="help-list"><li><h3>Собери свою армию</h3><p>На синих территориях автоматически появляются новые бойцы. Число в круге — размер гарнизона.</p></li><li><h3>Выбери цель</h3><p>Нажми на свою территорию, затем на цель. Или перетащи отряд от своей базы к другой земле. Всегда отправляется 100% текущего гарнизона: по четыре бойца каждые 0,1 секунды. Новые бойцы остаются на базе.</p></li><li><h3>Расширяй границы</h3><p>Каждый шарик — отдельный боец. Встречные вражеские бойцы уничтожают друг друга один к одному, в том числе на пересечении маршрутов. Союзники свободно пролетают мимо. Бойцы захватывают землю постепенно, уменьшая гарнизон при каждом прибытии. На свои земли можно отправлять подкрепления. Серые земли не наращивают армию.</p></li><li><h3>Захвати всю карту</h3><p>Победи все армии соперников и открой следующую операцию. На первых уровнях боты медлят и ошибаются; к 1000-му действуют быстро, координируют атаки и имеют огромное преимущество в армии. Пока у соперника есть отряды в пути, битва продолжается.</p></li></ol><div class="help-foot">Компьютер: Shift + нажатие выбирает несколько баз. Enter или пробел активируют территорию с клавиатуры. Пробел вне карты ставит игру на паузу. На телефоне работают нажатия и перетаскивание.</div>`, 'STATE.IO / КАК ИГРАТЬ');
 }
 function renderMultiplayer() {
   const room = multiplayer, mine = myOwner(), won = room.game?.winner === mine;
@@ -369,7 +368,7 @@ function enterRoom(room) {
   roomStream.addEventListener('state', event => {
     const fresh = JSON.parse(event.data), wasLobby = multiplayer?.state === 'lobby', started = fresh.game && !multiplayer?.game;
     if (!multiplayer || fresh.code !== multiplayer.code) return;
-    if (fresh.game) fresh.game.fleets = fresh.game.fleets.map(([id, from, to, owner, progress]) => ({ id, from, to, owner, progress, units: 1, duration: Math.hypot(fresh.game.nodes[to].x - fresh.game.nodes[from].x, fresh.game.nodes[to].y - fresh.game.nodes[from].y) / 105 }));
+    if (fresh.game) fresh.game.fleets = fresh.game.fleets.map(([id, from, to, owner, progress]) => ({ id, from, to, owner, progress, units: 1, duration: Math.hypot(fresh.game.nodes[to].x - fresh.game.nodes[from].x, fresh.game.nodes[to].y - fresh.game.nodes[from].y) / TRAVEL_SPEED }));
     multiplayer = { ...fresh, connected: true }; snapshotTime = performance.now();
     if (fresh.game) game = fresh.game;
     if (started) { selected = []; buildMap(); }
@@ -400,7 +399,7 @@ async function openMultiplayer() {
 }
 function openResult() {
   const won = game.status === 'won';
-  openModal('result', `<div class="result-hero">${icon(won ? 'cup' : 'restart')}</div><h2 class="modal-title">${won ? 'Эта карта — твоя.' : 'Битва окончена. Игра продолжается.'}</h2><p class="modal-description">${won ? game.level === TOTAL_LEVELS ? 'Все 24 операции позади. Твоя империя построена.' : 'Отличный ход. Следующая операция уже доступна.' : 'Попробуй другую стратегию: наращивай армию, захватывай свободные земли и защищай свою базу.'}</p><div class="result-stats"><div><strong>${formatTime(game.time)}</strong><span>Время битвы</span></div><div><strong>${String(game.level).padStart(2, '0')}</strong><span>Операция</span></div><div><strong>${profile.wins}</strong><span>Побед</span></div></div><div class="button-stack"><button class="primary-button" data-action="result-next">${won ? game.level === TOTAL_LEVELS ? 'Карта кампании' : 'Следующая операция' : 'Ещё одна попытка'} ${icon('arrow')}</button><button class="secondary-button" data-action="close">Посмотреть карту</button></div>`, won ? 'STATE.IO / ПОБЕДА' : 'STATE.IO / НОВЫЙ ШАНС');
+  openModal('result', `<div class="result-hero">${icon(won ? 'cup' : 'restart')}</div><h2 class="modal-title">${won ? 'Эта карта — твоя.' : 'Битва окончена. Игра продолжается.'}</h2><p class="modal-description">${won ? game.level === TOTAL_LEVELS ? 'Все 1000 операций позади. Твоя империя построена.' : 'Отличный ход. Следующая операция уже доступна.' : 'Попробуй другую стратегию: наращивай армию, захватывай свободные земли и защищай свою базу.'}</p><div class="result-stats"><div><strong>${formatTime(game.time)}</strong><span>Время битвы</span></div><div><strong>${String(game.level).padStart(2, '0')}</strong><span>Операция</span></div><div><strong>${profile.wins}</strong><span>Побед</span></div></div><div class="button-stack"><button class="primary-button" data-action="result-next">${won ? game.level === TOTAL_LEVELS ? 'Карта кампании' : 'Следующая операция' : 'Ещё одна попытка'} ${icon('arrow')}</button><button class="secondary-button" data-action="close">Посмотреть карту</button></div>`, won ? 'STATE.IO / ПОБЕДА' : 'STATE.IO / НОВЫЙ ШАНС');
 }
 function openConflict() {
   openModal('conflict', `<h2 class="modal-title">Две партии. Один аккаунт.</h2><p class="modal-description">На другом устройстве появилось новое сохранение. Текущая партия остаётся на этом устройстве, пока ты не выберешь версию.</p><div class="button-stack"><button class="primary-button" data-action="use-cloud">Загрузить партию из аккаунта ${icon('cloud')}</button><button class="secondary-button" data-action="use-local">Заменить облачную партию текущей</button></div><p class="form-note">Замена сохранения затронет все устройства этого аккаунта.</p>`, 'STATE.IO / СИНХРОНИЗАЦИЯ');
@@ -443,7 +442,7 @@ $('modalBody').addEventListener('click', async e => {
   if (levelButton && !levelButton.disabled) {
     const level = Number(levelButton.dataset.level);
     if (level === game.level) { closeModal(); return; }
-    openModal('level-confirm', `<h2 class="modal-title">Операция ${String(level).padStart(2, '0')}.</h2><p class="modal-description">${titles[level - 1]}. Текущая партия будет заменена новой. Пройденные уровни сохранятся.</p><div class="button-stack"><button class="primary-button" data-action="change-level" data-target="${level}">Начать операцию ${icon('arrow')}</button><button class="secondary-button" data-action="campaign">Вернуться к кампании</button></div>`); return;
+    openModal('level-confirm', `<h2 class="modal-title">Операция ${String(level).padStart(2, '0')}.</h2><p class="modal-description">${levelTitle(level)}. Текущая партия будет заменена новой. Пройденные уровни сохранятся.</p><div class="button-stack"><button class="primary-button" data-action="change-level" data-target="${level}">Начать операцию ${icon('arrow')}</button><button class="secondary-button" data-action="campaign">Вернуться к кампании</button></div>`); return;
   }
   const button = e.target.closest('[data-action]'); if (!button) return;
   const action = button.dataset.action;
@@ -458,6 +457,7 @@ $('modalBody').addEventListener('click', async e => {
   if (action === 'register-tab') openAuth('register');
   if (action === 'close') closeModal();
   if (action === 'campaign') openCampaign();
+  if (action === 'campaign-page') openCampaign(Number(button.dataset.page));
   if (action === 'restart') { closeModal(); newLevel(game.level, true); }
   if (action === 'change-level') { const level = Number(button.dataset.target); if (level <= profile.unlocked) { closeModal(); newLevel(level, true); } }
   if (action === 'result-next') { closeModal(); startGame(); }
@@ -513,6 +513,7 @@ $('modalBody').addEventListener('submit', async e => {
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' && !$('modal').open && !e.target.closest('input,button,select,[data-node]')) { e.preventDefault(); if (game.status === 'playing') { pauseGame(); void saveCloud(); } else startGame(); }
 });
+document.addEventListener('change', e => { if (e.target.id === 'campaignPage') openCampaign(Number(e.target.value)); });
 document.addEventListener('visibilitychange', () => { if (document.hidden) { pauseGame(); localSave(); void saveCloud(); } });
 window.addEventListener('pagehide', () => { pauseGame(); localSave(); });
 window.addEventListener('beforeunload', e => { localSave(); if (user && dirty && game.time > 0) { e.preventDefault(); e.returnValue = ''; } });
