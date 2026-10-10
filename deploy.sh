@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Ubuntu 22.04+ / Debian 12+, x86_64 or arm64. Run from the extracted project directory.
-# Usage: sudo bash deploy.sh game.example.com admin@example.com
+# Usage: sudo bash deploy.sh game.example.com [admin@example.com]
 set -Eeuo pipefail
 umask 027
 export DEBIAN_FRONTEND=noninteractive
@@ -16,7 +16,12 @@ trap 'echo "Installation failed at line $LINENO. Inspect: journalctl -u state-io
 
 [[ $EUID -eq 0 ]] || { echo 'Run this script with sudo.' >&2; exit 1; }
 [[ "$DOMAIN" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ && ${#DOMAIN} -le 253 ]] || { echo 'Usage: sudo bash deploy.sh game.example.com admin@example.com' >&2; exit 1; }
-[[ "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || { echo 'Provide a valid email for HTTPS certificate renewal.' >&2; exit 1; }
+if [[ -n "$EMAIL" ]]; then
+  [[ "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || { echo 'Provide a valid email for HTTPS certificate renewal.' >&2; exit 1; }
+  CERTBOT_ACCOUNT=(--email "$EMAIL")
+else
+  CERTBOT_ACCOUNT=(--register-unsafely-without-email)
+fi
 [[ -f "$SOURCE/server.mjs" && -d "$SOURCE/public" ]] || { echo 'Keep deploy.sh beside server.mjs and public/.' >&2; exit 1; }
 [[ "$SOURCE" != "$BASE/current" && "$SOURCE" != "$BASE/releases/"* ]] || { echo 'Run from a separate extracted source directory.' >&2; exit 1; }
 [[ -f /etc/os-release ]] || { echo 'Ubuntu/Debian required.' >&2; exit 1; }
@@ -150,7 +155,7 @@ systemctl reload-or-restart nginx
 echo '[6/7] Obtaining HTTPS certificate…'
 echo 'The domain must already point to this server; TCP ports 80 and 443 must be open.'
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then ufw allow 'Nginx Full'; fi
-certbot --nginx --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" --redirect --keep-until-expiring
+certbot --nginx --non-interactive --agree-tos "${CERTBOT_ACCOUNT[@]}" -d "$DOMAIN" --redirect --keep-until-expiring
 systemctl enable --now certbot.timer
 
 echo '[7/7] Installing daily online SQLite backups…'
