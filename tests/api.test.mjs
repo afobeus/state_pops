@@ -72,7 +72,7 @@ test('invalid payloads, foreign origins, missing origin and oversized requests r
   assert.equal((await request('/api/save', 'PUT', { version: 2, save: invalid }, cookieA)).status, 400);
   assert.equal((await request('/api/save', 'PUT', { version: 2, save: save() }, cookieA, { Origin: 'https://evil.example' })).status, 403);
   const missing = await fetch(`${origin}/api/logout`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookieA }, body: '{}' }); assert.equal(missing.status, 403);
-  assert.equal((await request('/api/save', 'PUT', { version: 2, save: save(), padding: 'x'.repeat(101000) }, cookieA)).status, 413);
+  assert.equal((await request('/api/save', 'PUT', { version: 2, save: save(), padding: 'x'.repeat(1500001) }, cookieA)).status, 413);
   const smallPassword = await request('/api/register', 'POST', { name: 'К', email: 'bad', password: 'x' }); assert.equal(smallPassword.status, 400);
 });
 test('logout revokes only this session while other device keeps its save', async () => {
@@ -88,6 +88,45 @@ test('SQLite accounts, sessions and snapshots survive a server restart', async (
   const restored = await request('/api/save', 'GET', undefined, cookieA2);
   assert.equal(restored.data.version, 2); assert.equal(restored.data.save.game.time, 17);
 });
+test('two authenticated humans share a live authoritative battle, reconnect, and cannot control each other', async () => {
+  assert.equal((await request('/api/rooms')).status, 401);
+  const created = await request('/api/rooms', 'POST', { map: 4 }, cookieA2);
+  assert.equal(created.status, 201); const code = created.data.room.code;
+  assert.match(code, /^[A-F0-9]{6}$/);
+  assert.equal((await request(`/api/rooms/${code}/start`, 'POST', {}, cookieA2)).status, 409);
+  assert.equal((await request('/api/rooms/join', 'POST', { code: code.toLowerCase() }, cookieB)).status, 200);
+  assert.equal((await request('/api/rooms/join', 'POST', { code }, cookieB)).data.room.players.length, 2);
+  assert.equal((await request('/api/rooms', 'POST', { map: 1 }, cookieB)).status, 409);
+  assert.equal((await request(`/api/rooms/${code}/start`, 'POST', {}, cookieB)).status, 403);
+  const a = new AbortController(), b = new AbortController();
+  try {
+    const streamA = await fetch(`${origin}/api/rooms/${code}/stream`, { headers: { Cookie: cookieA2 }, signal: a.signal });
+    const streamB = await fetch(`${origin}/api/rooms/${code}/stream`, { headers: { Cookie: cookieB }, signal: b.signal });
+    assert.match(streamA.headers.get('content-type'), /text\/event-stream/);
+    assert.equal(streamB.status, 200);
+    assert.equal((await request(`/api/rooms/${code}/start`, 'POST', {}, cookieA2)).status, 200);
+    const room = (await request('/api/rooms', 'GET', undefined, cookieB)).data.room;
+    const mine = room.game.nodes.find(n => n.owner === 1), enemy = room.game.nodes.find(n => n.owner === 0), target = room.game.nodes.find(n => n.owner === -1);
+    assert.equal((await request(`/api/rooms/${code}/dispatch`, 'POST', { sources: [enemy.id], target: target.id, units: 99999 }, cookieB)).status, 403);
+    assert.equal((await request(`/api/rooms/${code}/dispatch`, 'POST', { sources: [mine.id], target: target.id, units: 99999 }, cookieB)).data.sent, 55);
+    await new Promise(r => setTimeout(r, 250));
+    const ongoing = (await request('/api/rooms', 'GET', undefined, cookieA2)).data.room.game;
+    assert.ok(ongoing.fleets.length >= 4); assert.ok(ongoing.fleets.every(f => f.owner === 1 && f.units === 1));
+    assert.ok(ongoing.orders[0].remaining < 55);
+    const packet = await streamA.body.getReader().read(); assert.match(new TextDecoder().decode(packet.value), /event: state/);
+    b.abort(); await new Promise(r => setTimeout(r, 60));
+    assert.equal((await request('/api/rooms', 'GET', undefined, cookieB)).data.room.code, code);
+    const c = new AbortController();
+    const resumed = await fetch(`${origin}/api/rooms/${code}/stream`, { headers: { Cookie: cookieB }, signal: c.signal });
+    assert.equal(resumed.status, 200); c.abort();
+    assert.equal((await request(`/api/rooms/${code}/leave`, 'POST', {}, cookieB)).status, 200);
+    const end = (await request('/api/rooms', 'GET', undefined, cookieA2)).data.room;
+    assert.equal(end.state, 'finished'); assert.equal(end.game.winner, 0);
+    assert.equal((await request(`/api/rooms/${code}/leave`, 'POST', {}, cookieA2)).status, 200);
+    assert.equal((await request('/api/rooms', 'GET', undefined, cookieA2)).data.room, null);
+  } finally { a.abort(); b.abort(); }
+});
+
 test('persistent rate limits stop repeated password guesses', async () => {
   let result;
   for (let i = 0; i < 16; i++) result = await request('/api/login', 'POST', { email: 'alpha@example.com', password: 'wrong-password-123' });

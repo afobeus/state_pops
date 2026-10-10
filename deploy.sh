@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Ubuntu 22.04+ / Debian 12+, x86_64 or arm64. Run from the extracted project directory.
-# Usage: sudo bash deploy.sh game.example.com [admin@example.com]
+# Usage: sudo bash deploy.sh game.example.com [admin@example.com] [--existing-proxy]
 set -Eeuo pipefail
 umask 027
 export DEBIAN_FRONTEND=noninteractive
 
 DOMAIN="${1:-}"
 EMAIL="${2:-}"
+PROXY_MODE="${3:-}"
+if [[ "$EMAIL" == --existing-proxy ]]; then EMAIL=""; PROXY_MODE=--existing-proxy; fi
+[[ -z "$PROXY_MODE" || "$PROXY_MODE" == --existing-proxy ]] || { echo 'Unknown option.' >&2; exit 1; }
 BASE=/opt/state-io
 STATE=/var/lib/state-io
 SOURCE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -29,10 +32,15 @@ fi
 [[ "$ID" == ubuntu || "$ID" == debian ]] || { echo 'This installer supports Ubuntu and Debian.' >&2; exit 1; }
 case "$(uname -m)" in x86_64) ARCH=x64 ;; aarch64|arm64) ARCH=arm64 ;; *) echo 'Unsupported CPU architecture.' >&2; exit 1 ;; esac
 DOMAIN="${DOMAIN,,}"
+if [[ "$PROXY_MODE" != --existing-proxy ]] && systemctl is-active --quiet caddy; then
+  echo 'Caddy is already running. Rerun with --existing-proxy to preserve your reverse proxy.' >&2
+  exit 1
+fi
 
 echo '[1/7] Installing system packages…'
 apt-get update
-apt-get install -y ca-certificates curl xz-utils rsync nginx certbot python3-certbot-nginx sqlite3
+apt-get install -y ca-certificates curl xz-utils rsync sqlite3
+if [[ "$PROXY_MODE" != --existing-proxy ]]; then apt-get install -y nginx certbot python3-certbot-nginx; fi
 
 echo '[2/7] Installing the latest Node.js 24 LTS release…'
 WORK="$(mktemp -d /tmp/state-io.XXXXXXXX)"
@@ -58,6 +66,7 @@ rsync -a --exclude='.git/' --exclude='data/' --exclude='.env' --exclude='node_mo
 chown -R root:root "$RELEASE"
 chmod -R a+rX "$RELEASE"
 "$BASE/node/bin/node" --check "$RELEASE/server.mjs"
+"$BASE/node/bin/node" --check "$RELEASE/multiplayer.mjs"
 "$BASE/node/bin/node" --check "$RELEASE/public/app.js"
 "$BASE/node/bin/node" --test "$RELEASE"/tests/*.test.mjs
 cat > /etc/state-io/app.env <<EOF
@@ -123,6 +132,7 @@ if [[ "$READY" != 1 ]]; then
 fi
 
 echo '[5/7] Configuring Nginx…'
+if [[ "$PROXY_MODE" != --existing-proxy ]]; then
 NGINX_CONFIG=/etc/nginx/sites-available/state-io.conf
 if [[ -f "$NGINX_CONFIG" ]]; then cp -a "$NGINX_CONFIG" "$WORK/nginx.previous"; fi
 cat > "$NGINX_CONFIG" <<EOF
@@ -130,7 +140,7 @@ server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN;
-    client_max_body_size 100k;
+    client_max_body_size 1500k;
     location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
@@ -138,7 +148,9 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-For \$remote_addr;
-        proxy_read_timeout 30s;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 75s;
         proxy_connect_timeout 5s;
     }
 }
@@ -157,6 +169,10 @@ echo 'The domain must already point to this server; TCP ports 80 and 443 must be
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then ufw allow 'Nginx Full'; fi
 certbot --nginx --non-interactive --agree-tos "${CERTBOT_ACCOUNT[@]}" -d "$DOMAIN" --redirect --keep-until-expiring
 systemctl enable --now certbot.timer
+else
+  echo 'Existing reverse proxy preserved. Route this domain to 127.0.0.1:3000.'
+  echo 'For SSE multiplayer disable response buffering and use a read timeout of at least 75 seconds.'
+fi
 
 echo '[7/7] Installing daily online SQLite backups…'
 cat > /usr/local/sbin/state-io-backup <<'EOF'
@@ -197,9 +213,13 @@ EOF
 systemctl daemon-reload
 systemctl enable --now state-io-backup.timer
 systemctl start state-io-backup.service
-curl --fail --silent --show-error "https://$DOMAIN/api/health"
+if [[ "$PROXY_MODE" != --existing-proxy ]]; then curl --fail --silent --show-error "https://$DOMAIN/api/health"; else curl --fail --silent --show-error http://127.0.0.1:3000/api/health; fi
 echo
-echo "Ready: https://$DOMAIN"
+if [[ "$PROXY_MODE" == --existing-proxy ]]; then
+  echo "Application ready on 127.0.0.1:3000. Complete HTTPS routing for $DOMAIN with your existing proxy."
+else
+  echo "Ready: https://$DOMAIN"
+fi
 echo 'Logs: sudo journalctl -u state-io -f'
 echo 'Backups: /var/lib/state-io/backups (copy these to another machine regularly).'
 echo "Previous release: ${PREVIOUS:-none}. Releases are preserved under /opt/state-io/releases."

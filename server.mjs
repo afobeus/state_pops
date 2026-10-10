@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateSave } from './public/engine.js';
+import { createRooms } from './multiplayer.mjs';
 
 const derive = promisify(pbkdf2);
 const root = dirname(fileURLToPath(import.meta.url));
@@ -50,12 +51,12 @@ function limit(key, max, windowMs) {
   const row = db.prepare('INSERT INTO rate_limits(key,count,reset_at) VALUES (?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN reset_at<=? THEN 1 ELSE count+1 END, reset_at=CASE WHEN reset_at<=? THEN ? ELSE reset_at END RETURNING count,reset_at').get(key, now + windowMs, now, now, now + windowMs);
   if (row.count > max) throw err(429, 'Слишком много попыток. Попробуйте позже.');
 }
-async function body(req) {
+async function body(req, maximum = 100000) {
   if (!req.headers['content-type']?.startsWith('application/json')) throw err(415, 'Ожидается JSON');
   let length = 0; const chunks = [];
   for await (const chunk of req) {
     length += chunk.length;
-    if (length > 100000) throw err(413, 'Слишком большой запрос');
+    if (length > maximum) throw err(413, 'Слишком большой запрос');
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString()); } catch { throw err(400, 'Некорректный JSON'); }
@@ -76,6 +77,7 @@ function createSession(res, user) {
   db.prepare('INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)').run(hashToken(token), user.id, Date.now() + 30 * 86400000);
   cookie(res, token);
 }
+const multiplayer = createRooms({ json, err, body, limit, currentUser });
 async function api(req, res, path) {
   if (!['GET', 'POST', 'PUT'].includes(req.method)) throw err(405, 'Метод не поддерживается');
   if (req.method !== 'GET') {
@@ -85,6 +87,7 @@ async function api(req, res, path) {
     db.prepare('SELECT 1').get(); return json(res, 200, { ok: true });
   }
   const user = currentUser(req);
+  if (path === '/api/rooms' || path.startsWith('/api/rooms/')) return multiplayer.handle(req, res, path, user);
   if (path === '/api/me' && req.method === 'GET') return json(res, 200, { user: user ? publicUser(user) : null });
   if (['/api/register', '/api/login'].includes(path) && req.method === 'POST') {
     // X-Real-IP is trusted only for the loopback reverse proxy configured by deploy.sh.
@@ -122,7 +125,7 @@ async function api(req, res, path) {
     }
     if (req.method === 'PUT') {
       limit(`save:${user.id}`, 120, 60000);
-      const input = await body(req);
+      const input = await body(req, 1500000);
       if (!Number.isInteger(input.version) || input.version < 0) throw err(400, 'Некорректная версия');
       let save; try { save = validateSave(input.save); } catch { throw err(400, 'Некорректное сохранение'); }
       const updatedAt = Date.now(), data = JSON.stringify(save);
@@ -166,4 +169,4 @@ const cleanup = setInterval(() => {
   db.prepare('DELETE FROM rate_limits WHERE reset_at<?').run(Date.now());
 }, 60000).unref();
 server.listen(PORT, HOST, () => console.log(`State.io: ${origin} (listening on ${HOST}:${PORT})`));
-for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { clearInterval(cleanup); server.close(() => { db.close(); process.exit(0); }); });
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { clearInterval(cleanup); multiplayer.close(); server.close(() => { db.close(); process.exit(0); }); });
