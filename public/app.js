@@ -1,0 +1,423 @@
+import { createGame, step, dispatch, recordResult, DEFAULT_PROFILE, validateSave, TOTAL_LEVELS, COLORS } from './engine.js';
+
+const $ = id => document.getElementById(id);
+const icon = name => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
+const escape = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const titles = ['Первые рубежи', 'Встречный ветер', 'Три берега', 'Перекрёсток', 'Линия фронта', 'За горизонтом', 'Четвёртая сила', 'Тихая гавань', 'Остров надежды', 'Точка опоры', 'Большой переход', 'Новый рубеж', 'Дальний восток', 'Союз островов', 'Земли рассвета', 'Высокая ставка', 'Золотой берег', 'В сердце карты', 'Последний бастион', 'Обратный отсчёт', 'Сила империи', 'Решающая битва', 'Все пути', 'Твоя империя'];
+const chapters = ['Начало пути', 'Новые горизонты', 'Время империи', 'Последний рубеж'];
+let profile = DEFAULT_PROFILE(), game = createGame(), user = null;
+let version = 0, updatedAt = null, dirty = false, revision = 0, saving = null, conflict = false, authUnknown = false, accountReady = false, syncError = false;
+let selected = [], portrait = matchMedia('(max-width:650px)').matches, dragging = null, suppressClick = false;
+let refs = [], lastFrame = 0, lastRender = 0, toastTimeout, audio, currentModal = '', resultShown = false;
+const localKey = () => user ? `stateio.account.${user.id}` : 'stateio.guest';
+function snapshot() { return JSON.parse(JSON.stringify({ schema: 1, profile, game })); }
+function markDirty() { dirty = true; revision++; }
+function localSave() {
+  try { localStorage.setItem(localKey(), JSON.stringify({ save: snapshot(), version, updatedAt, dirty })); }
+  catch { setSync('Хранилище устройства недоступно', 'error'); }
+}
+function loadSnapshot(save) {
+  ({ profile, game } = validateSave(save));
+  if (game.status === 'playing') game.status = 'paused';
+  selected = []; resultShown = game.resultRecorded; dragging = null;
+  applySettings(); buildMap(); render();
+}
+function loadLocal() {
+  try { const raw = localStorage.getItem(localKey()); if (!raw) return false; const stored = JSON.parse(raw); loadSnapshot(stored.save); version = stored.version || 0; updatedAt = stored.updatedAt; dirty = Boolean(stored.dirty); if (dirty) revision++; return true; }
+  catch { return false; }
+}
+function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toastTimeout); toastTimeout = setTimeout(() => $('toast').hidden = true, 4500); }
+function setSync(text, className = '') { $('syncText').textContent = text; $('syncStatus').className = `sync-pill ${className}`; }
+async function api(path, options = {}) {
+  const response = await fetch(`/api/${path}`, { credentials: 'same-origin', ...options, headers: { 'Content-Type': 'application/json', ...options.headers } });
+  const data = await response.json();
+  if (!response.ok) throw Object.assign(new Error(data.error || 'Не удалось выполнить запрос'), { status: response.status, data });
+  return data;
+}
+function userUI() {
+  $('accountName').textContent = user ? user.name : 'Войти в аккаунт';
+  $('avatar').textContent = user ? [...user.name][0].toUpperCase() : 'Г';
+  $('cloudTitle').textContent = user ? 'Твоя империя всегда рядом.' : 'Одна империя. Любое устройство.';
+  $('cloudDescription').textContent = user ? 'Прогресс сохраняется в аккаунте. Продолжай игру с любого устройства.' : 'Войди, чтобы сохранить прогресс и продолжить игру на телефоне.';
+  try { if (user) localStorage.setItem('stateio.lastUser', JSON.stringify(user)); else localStorage.removeItem('stateio.lastUser'); } catch { /* Browser storage may be restricted. */ }
+}
+function syncLabel() {
+  if (conflict) return setSync('Конфликт сохранений', 'error');
+  if (authUnknown) return setSync('Сервер недоступен', 'error');
+  if (!user) return setSync('Локальное сохранение');
+  if (!navigator.onLine) return setSync('Нет сети · сохранено на устройстве', 'error');
+  if (saving) return setSync('Синхронизация…');
+  if (syncError) return setSync('Нет связи · сохранено на устройстве', 'error');
+  if (dirty) return setSync('Есть несохранённые изменения');
+  setSync('Сохранено в аккаунте', 'synced');
+}
+async function saveCloud({ quiet = true, force = false } = {}) {
+  localSave();
+  if (!user || !accountReady || conflict || !navigator.onLine || (!dirty && !force)) { syncLabel(); return !conflict && !dirty; }
+  if (saving) { await saving; if (!conflict && dirty) return saveCloud({ quiet, force }); return !dirty; }
+  const capturedRevision = revision, capturedUser = user.id;
+  const payload = { version, save: snapshot() };
+  saving = (async () => {
+    try {
+      const data = await api('save', { method: 'PUT', body: JSON.stringify(payload) });
+      if (user?.id !== capturedUser) return;
+      version = data.version; updatedAt = data.updatedAt; syncError = false;
+      if (capturedRevision === revision) dirty = false;
+      localSave();
+      if (!quiet) toast('Прогресс сохранён в аккаунте');
+    } catch (e) {
+      if (e.status === 409) { conflict = true; pauseGame(); openConflict(); }
+      else if (e.status === 401) { authUnknown = true; accountReady = false; pauseGame(); toast('Сессия завершилась. Войди снова, чтобы синхронизировать прогресс.'); }
+      else { syncError = true; setSync('Сохранено на устройстве · нет связи', 'error'); if (!quiet) toast('Сервер недоступен. Прогресс сохранён на этом устройстве.'); }
+    }
+  })();
+  syncLabel(); await saving; saving = null;
+  if (!authUnknown) syncLabel();
+  return !dirty && !conflict;
+}
+async function initializeAccount() {
+  try {
+    const data = await api('me'); authUnknown = false;
+    if (data.user) {
+      user = data.user; userUI();
+      const local = (() => { try { return JSON.parse(localStorage.getItem(localKey())); } catch { return null; } })();
+      const cloud = await api('save'); accountReady = true; syncError = false;
+      version = cloud.version; updatedAt = cloud.updatedAt;
+      if (cloud.save) {
+        if (local?.save && local.dirty && local.version === cloud.version && JSON.stringify(local.save) !== JSON.stringify(cloud.save)) {
+          loadSnapshot(local.save); markDirty(); toast('Продолжаем сохранение с этого устройства'); await saveCloud();
+        } else if (local?.save && local.dirty && local.version !== cloud.version && JSON.stringify(local.save) !== JSON.stringify(cloud.save)) {
+          loadSnapshot(local.save); markDirty(); conflict = true; openConflict();
+        } else { loadSnapshot(cloud.save); dirty = false; revision++; }
+      } else {
+        if (!loadLocal()) { profile = DEFAULT_PROFILE(); game = createGame(); buildMap(); render(); }
+        version = 0; markDirty(); await saveCloud();
+      }
+      localSave();
+    } else if (user) {
+      localSave(); user = null; accountReady = false; version = 0; updatedAt = null; dirty = false;
+      profile = DEFAULT_PROFILE(); game = createGame(); if (!loadLocal()) { buildMap(); render(); }
+    }
+    userUI(); syncLabel();
+  } catch { authUnknown = true; accountReady = false; setSync('Сервер недоступен', 'error'); }
+}
+function projected(n) { return portrait ? { x: n.y, y: n.x } : { x: n.x * 1.2, y: n.y * .6 + 10 }; }
+function clip(polygon, a, b, c) {
+  const out = [];
+  for (let i = 0; i < polygon.length; i++) {
+    const p = polygon[i], q = polygon[(i + 1) % polygon.length];
+    const dp = a * p[0] + b * p[1] - c, dq = a * q[0] + b * q[1] - c;
+    if (dp <= 0) out.push(p);
+    if ((dp <= 0) !== (dq <= 0)) { const t = dp / (dp - dq); out.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]); }
+  }
+  return out;
+}
+function buildMap() {
+  const w = portrait ? 590 : 920, h = portrait ? 780 : 370;
+  $('map').setAttribute('viewBox', `0 0 ${w} ${h}`);
+  const rect = $('map').querySelector('rect'); rect.setAttribute('width', w); rect.setAttribute('height', h);
+  const outline = [[45, 95], [120, 42], [420, 38], [620, 60], [725, 156], [735, 405], [658, 524], [440, 547], [135, 530], [42, 418], [30, 223]].map(p => portrait ? [p[1], p[0]] : [p[0] * 1.2, p[1] * .6 + 10]);
+  refs = [];
+  $('terrain').innerHTML = game.nodes.map((n, i) => {
+    const center = projected(n);
+    let poly = outline;
+    for (const other of game.nodes) {
+      if (other.id === n.id) continue;
+      const q = projected(other), a = q.x - center.x, b = q.y - center.y;
+      poly = clip(poly, a, b, (q.x * q.x + q.y * q.y - center.x * center.x - center.y * center.y) / 2);
+    }
+    const path = poly.map(([x, y]) => `${(center.x + (x - center.x) * .94).toFixed(1)},${(center.y + (y - center.y) * .94).toFixed(1)}`).join(' ');
+    return `<g class="territory" data-node="${i}" role="button" tabindex="0" aria-label=""><polygon class="province" points="${path}"/><circle class="selected-ring" cx="${center.x}" cy="${center.y}" r="32"/><circle class="node-circle" cx="${center.x}" cy="${center.y}" r="23"/><text class="count" x="${center.x}" y="${center.y}">${Math.floor(n.units)}</text>${i === 0 ? `<text class="crown" x="${center.x}" y="${center.y - 40}">ТВОЯ БАЗА</text>` : ''}</g>`;
+  }).join('');
+  refs = [...$('terrain').children].map(el => ({ el, province: el.querySelector('.province'), circle: el.querySelector('.node-circle'), count: el.querySelector('.count') }));
+  renderMap();
+}
+function renderMap() {
+  const fills = ['#a4c5f4', '#edb0a6', '#e7d497', '#ceb9e0'];
+  for (const n of game.nodes) {
+    const r = refs[n.id]; if (!r) continue;
+    r.province.setAttribute('fill', n.owner < 0 ? '#dbe3db' : fills[n.owner]);
+    r.circle.setAttribute('stroke', n.owner < 0 ? '#c7d3c6' : COLORS[n.owner]);
+    r.count.textContent = Math.floor(n.units);
+    r.el.classList.toggle('selected', selected.includes(n.id) && n.owner === 0);
+    r.el.setAttribute('aria-label', `Территория ${n.id + 1}, ${n.owner === 0 ? 'твоя' : n.owner < 0 ? 'свободная' : 'соперник'}, армия ${Math.floor(n.units)}`);
+  }
+  $('fleetLayer').innerHTML = game.fleets.map(f => {
+    const from = projected(game.nodes[f.from]), to = projected(game.nodes[f.to]);
+    const count = Math.min(7, Math.ceil(f.units / 8)), dx = to.x - from.x, dy = to.y - from.y;
+    let dots = '';
+    for (let j = 0; j < count; j++) {
+      const t = Math.max(0, f.progress - j * .02);
+      dots += `<circle cx="${(from.x + dx * t).toFixed(1)}" cy="${(from.y + dy * t).toFixed(1)}" r="${j === 0 ? 4 : 2.5}" fill="${COLORS[f.owner]}" class="fleet-dot"/>`;
+    }
+    return dots;
+  }).join('');
+}
+function formatTime(seconds) { return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`; }
+function render() {
+  const level = game.level, chapter = Math.floor((level - 1) / 6);
+  $('levelChip').textContent = String(level).padStart(2, '0');
+  $('levelName').textContent = titles[level - 1]; $('levelSubtitle').textContent = `Глава ${chapter + 1} · ${chapters[chapter]}`;
+  $('operationNumber').textContent = String(level).padStart(2, '0');
+  $('chapterNumber').textContent = String(chapter + 1).padStart(2, '0'); $('chapterTitle').textContent = chapters[chapter];
+  $('chapterDescription').textContent = ['Даже большая империя начинается с маленькой территории.', 'Новые земли, новые соперники. Твоя стратегия становится сильнее.', 'Четыре армии. Одна карта. Время сделать решающий ход.', 'Впереди самые сложные битвы. Победа уже близко.'][chapter];
+  const completed = Object.keys(profile.best).length;
+  $('campaignProgress').textContent = `${completed} / ${TOTAL_LEVELS}`; $('progressFill').style.width = `${completed / TOTAL_LEVELS * 100}%`;
+  $('timer').textContent = formatTime(game.time);
+  const mine = game.nodes.filter(n => n.owner === 0);
+  $('territoryCount').textContent = mine.length; $('territoryTotal').textContent = ` / ${game.nodes.length}`;
+  $('armyCount').textContent = Math.floor(mine.reduce((s, n) => s + n.units, 0) + game.fleets.filter(f => f.owner === 0).reduce((s, f) => s + f.units, 0));
+  $('winsCount').textContent = profile.wins; $('purpleKey').hidden = game.level <= 6;
+  const distribution = Array.from({ length: 5 }, (_, i) => game.nodes.filter(n => n.owner === i - 1).length);
+  $('factionBar').innerHTML = distribution.map((n, i) => `<span style="width:${n / game.nodes.length * 100}%;background:${i ? COLORS[i - 1] : '#d5dfd5'}"></span>`).join('');
+  const states = { ready: 'ПОДГОТОВКА', playing: 'В БОЮ', paused: 'ПАУЗА', won: 'ПОБЕДА', lost: 'ПОРАЖЕНИЕ' };
+  $('battleState').textContent = states[game.status];
+  $('pauseButton').innerHTML = icon(game.status === 'playing' ? 'pause' : 'play');
+  $('pauseButton').setAttribute('aria-label', game.status === 'playing' ? 'Приостановить игру' : 'Продолжить игру');
+  $('startOverlay').hidden = game.status === 'playing';
+  if (game.status !== 'playing') {
+    $('overlayTitle').textContent = { ready: 'Всё начинается с одной земли.', paused: 'Империя может подождать.', won: 'Эта карта — твоя.', lost: 'Новая тактика. Новый шанс.' }[game.status];
+    $('overlayText').textContent = { ready: 'Синие территории — твои. Отправляй отряды на соседние земли и захвати карту.', paused: 'Твоя партия на паузе. Продолжи, когда будешь готов сделать следующий ход.', won: game.level === TOTAL_LEVELS ? 'Ты завершил кампанию. Переиграй любимые уровни и улучши время.' : 'Все соперники побеждены. Впереди новые земли и новые возможности.', lost: 'Соперники захватили твои земли. Попробуй укрепить армию и атаковать слабые территории.' }[game.status];
+    $('startButton').innerHTML = `${{ ready: 'Начать наступление', paused: 'Продолжить битву', won: game.level === TOTAL_LEVELS ? 'Карта кампании' : 'Следующая операция', lost: 'Попробовать снова' }[game.status]} ${icon('arrow')}`;
+  }
+  selected = selected.filter(id => game.nodes[id]?.owner === 0);
+  $('selectionText').textContent = selected.length ? `Выбрано ${selected.length === 1 ? 'территорий: 1' : `территорий: ${selected.length}`} · отправится ${selected.reduce((s, id) => s + Math.floor(game.nodes[id].units * Number($('sendRange').value) / 100), 0)}` : 'Выбери синюю территорию';
+  $('selectionHint').textContent = selected.length ? 'Нажми на цель, чтобы отправить подкрепление' : 'Затем нажми на цель или перетащи отряд';
+  renderMap();
+}
+function applySettings() { document.body.classList.toggle('reduced-motion', profile.settings.reducedMotion); }
+function sound(kind = 'send') {
+  if (!profile.settings.sound) return;
+  try {
+    audio ??= new (window.AudioContext || window.webkitAudioContext)(); audio.resume();
+    const oscillator = audio.createOscillator(), gain = audio.createGain();
+    oscillator.connect(gain); gain.connect(audio.destination);
+    oscillator.type = 'sine'; oscillator.frequency.setValueAtTime(kind === 'win' ? 523 : 420, audio.currentTime);
+    oscillator.frequency.exponentialRampToValueAtTime(kind === 'win' ? 1046 : 700, audio.currentTime + .12);
+    gain.gain.setValueAtTime(.035, audio.currentTime); gain.gain.exponentialRampToValueAtTime(.001, audio.currentTime + .18);
+    oscillator.start(); oscillator.stop(audio.currentTime + .19);
+  } catch { /* Audio is optional. */ }
+}
+function pauseGame() { if (game.status === 'playing') { game.status = 'paused'; markDirty(); render(); localSave(); } }
+function startGame() {
+  if (conflict) return openConflict();
+  if (game.status === 'won') { if (game.level === TOTAL_LEVELS) return openCampaign(); return newLevel(game.level + 1, true); }
+  if (game.status === 'lost') return newLevel(game.level, true);
+  game.status = 'playing'; markDirty(); selected = []; lastFrame = performance.now(); render(); sound();
+}
+function newLevel(level, start = false) {
+  game = createGame(level, profile.settings.difficulty); if (start) game.status = 'playing';
+  selected = []; resultShown = false; markDirty(); buildMap(); render(); localSave(); void saveCloud();
+}
+function activateNode(id, multi = false) {
+  if (game.status !== 'playing') { if (game.status === 'ready' || game.status === 'paused') toast('Начни битву, чтобы отправить армию'); return; }
+  const node = game.nodes[id]; if (!node) return;
+  if (node.owner === 0 && (!selected.length || multi || selected.includes(id))) {
+    selected = multi ? selected.includes(id) ? selected.filter(i => i !== id) : [...selected, id] : selected.includes(id) ? [] : [id];
+  } else if (selected.length) {
+    const sent = dispatch(game, selected.filter(i => game.nodes[i].owner === 0), id, Number($('sendRange').value) / 100);
+    if (sent) { markDirty(); sound(); selected = []; }
+    else toast('Нужно больше бойцов, чтобы отправить отряд');
+  } else toast('Сначала выбери свою синюю территорию');
+  render();
+}
+function mapPoint(event) {
+  const pt = $('map').createSVGPoint(); pt.x = event.clientX; pt.y = event.clientY;
+  return pt.matrixTransform($('map').getScreenCTM().inverse());
+}
+$('map').addEventListener('pointerdown', e => {
+  const el = e.target.closest('[data-node]'); if (!el || game.status !== 'playing') return;
+  const id = Number(el.dataset.node); if (game.nodes[id].owner !== 0) return;
+  dragging = { id, x: e.clientX, y: e.clientY, moved: false, pointerId: e.pointerId };
+});
+$('map').addEventListener('pointermove', e => {
+  if (!dragging || dragging.pointerId !== e.pointerId) return;
+  if (Math.hypot(e.clientX - dragging.x, e.clientY - dragging.y) < 7 && !dragging.moved) return;
+  if (!dragging.moved) $('map').setPointerCapture(e.pointerId);
+  dragging.moved = true;
+  const from = projected(game.nodes[dragging.id]), to = mapPoint(e);
+  $('routeLayer').innerHTML = `<path class="route-line" d="M${from.x},${from.y}L${to.x},${to.y}"/>`;
+});
+$('map').addEventListener('pointerup', e => {
+  if (!dragging || dragging.pointerId !== e.pointerId) return;
+  const drag = dragging; dragging = null; $('routeLayer').innerHTML = '';
+  if ($('map').hasPointerCapture(e.pointerId)) $('map').releasePointerCapture(e.pointerId);
+  if (!drag.moved) return;
+  suppressClick = true; setTimeout(() => suppressClick = false, 0);
+  const el = document.elementFromPoint(e.clientX, e.clientY)?.closest('[data-node]');
+  if (el && Number(el.dataset.node) !== drag.id && game.nodes[drag.id].owner === 0) {
+    selected = [drag.id]; activateNode(Number(el.dataset.node));
+  }
+});
+$('map').addEventListener('pointercancel', () => { dragging = null; $('routeLayer').innerHTML = ''; });
+$('map').addEventListener('click', e => { if (suppressClick) return; const el = e.target.closest('[data-node]'); if (el) activateNode(Number(el.dataset.node), e.shiftKey); });
+$('map').addEventListener('keydown', e => { if (['Enter', ' '].includes(e.key)) { const el = e.target.closest('[data-node]'); if (el) { e.preventDefault(); activateNode(Number(el.dataset.node), e.shiftKey); } } });
+$('sendRange').addEventListener('input', () => { $('sendValue').textContent = `${$('sendRange').value}%`; render(); });
+$('startButton').addEventListener('click', startGame);
+$('pauseButton').addEventListener('click', () => { if (game.status === 'playing') { pauseGame(); void saveCloud(); } else startGame(); });
+$('restartButton').addEventListener('click', () => {
+  pauseGame(); openModal('restart', `<h2 class="modal-title">Начать заново?</h2><p class="modal-description">Текущая битва будет сброшена. Пройденные уровни и достижения сохранятся.</p><div class="button-stack"><button class="primary-button" data-action="restart">Перезапустить уровень ${icon('restart')}</button><button class="secondary-button" data-action="close">Вернуться к партии</button></div>`);
+});
+function openModal(type, html, eyebrow = 'STATE.IO / ТВОЯ СТРАТЕГИЯ') {
+  pauseGame(); void saveCloud(); currentModal = type;
+  $('modalEyebrow').textContent = eyebrow; $('modalBody').innerHTML = html;
+  if (!$('modal').open) $('modal').showModal();
+}
+function closeModal() { $('modal').close(); currentModal = ''; render(); }
+$('closeModal').addEventListener('click', closeModal);
+$('modal').addEventListener('click', e => { if (e.target === $('modal')) { const b = $('modal').getBoundingClientRect(); if (e.clientX < b.left || e.clientX > b.right || e.clientY < b.top || e.clientY > b.bottom) closeModal(); } });
+$('modal').addEventListener('close', () => { currentModal = ''; render(); });
+function openAuth(mode = 'login', error = '') {
+  openModal('auth', `<h2 class="modal-title">Твоя империя. Твой аккаунт.</h2><p class="modal-description">Сохраняй кампанию и продолжай с того же места на телефоне, планшете или компьютере.</p><div class="auth-tabs"><button data-action="login-tab" class="${mode === 'login' ? 'active' : ''}">Войти</button><button data-action="register-tab" class="${mode === 'register' ? 'active' : ''}">Создать аккаунт</button></div><form id="authForm" data-mode="${mode}">${mode === 'register' ? '<label class="form-field">Имя командира<input name="name" autocomplete="nickname" minlength="2" maxlength="24" placeholder="Как тебя называть?" required></label>' : ''}<label class="form-field">Email<input name="email" type="email" autocomplete="email" maxlength="254" placeholder="commander@example.com" required></label><label class="form-field">Пароль<input name="password" type="password" autocomplete="${mode === 'register' ? 'new-password' : 'current-password'}" minlength="10" maxlength="128" placeholder="Не менее 10 символов" required></label><p class="form-error" id="authError" role="alert">${escape(error)}</p><button class="primary-button full-width" type="submit">${mode === 'register' ? 'Создать аккаунт' : 'Войти в аккаунт'} ${icon('arrow')}</button></form><p class="form-note">Гостевой прогресс можно перенести в новый аккаунт.<br>Вход привязан к этому серверу игры.</p>`, 'STATE.IO / СОХРАНЕНИЯ');
+}
+function openAccount() {
+  if (!user || authUnknown) return openAuth();
+  openModal('account', `<h2 class="modal-title">Привет, ${escape(user.name)}.</h2><p class="modal-description">${escape(user.email)}<br>Войди в этот аккаунт по тому же адресу игры на другом устройстве, чтобы продолжить кампанию.</p><div class="account-summary"><div><span>Пройдено уровней</span><strong>${Object.keys(profile.best).length} / ${TOTAL_LEVELS}</strong></div><div><span>Последняя синхронизация</span><strong class="autosave-time">${updatedAt ? escape(new Date(updatedAt).toLocaleString('ru-RU')) : 'Ещё не сохранено'}</strong></div><div><span>Состояние</span><strong>${conflict ? 'Нужно выбрать версию' : dirty ? 'Ожидает синхронизации' : 'Сохранено в аккаунте'}</strong></div></div><div class="button-stack"><button class="primary-button" data-action="sync">${icon('cloud')} Синхронизировать сейчас</button><button class="secondary-button" data-action="reload-cloud">Загрузить с другого устройства</button></div><button class="danger-button" data-action="logout">Выйти из аккаунта</button>`, 'STATE.IO / ПРОФИЛЬ');
+}
+function openCampaign() {
+  let html = '<h2 class="modal-title">Твоя карта побед.</h2><p class="modal-description">24 операции. Четыре главы. Одна империя.<br>Победи всех соперников, чтобы открыть следующий уровень.</p>';
+  for (let chapter = 0; chapter < 4; chapter++) {
+    html += `<h3 class="chapter-heading">0${chapter + 1} / ${chapters[chapter]}</h3><div class="campaign-grid">`;
+    for (let i = chapter * 6 + 1; i <= (chapter + 1) * 6; i++) html += `<button class="level-button ${game.level === i ? 'current' : profile.best[i] !== undefined ? 'completed' : ''}" data-level="${i}" ${i > profile.unlocked ? 'disabled' : ''} aria-label="Уровень ${i}: ${titles[i - 1]}${i > profile.unlocked ? ', закрыт' : ''}" title="${titles[i - 1]}${profile.best[i] !== undefined ? ` · лучшее время ${formatTime(profile.best[i])}` : ''}">${i > profile.unlocked ? icon('lock') : String(i).padStart(2, '0')}${profile.best[i] !== undefined ? '<span class="mini-star">★</span>' : ''}</button>`;
+    html += '</div>';
+  }
+  html += '<p class="help-foot">Выбор другого уровня заменит текущую партию. Повторное прохождение улучшает личное время.</p>';
+  openModal('campaign', html, 'STATE.IO / КАМПАНИЯ');
+}
+function openAchievements() {
+  const achievements = [
+    ['Первый флаг', 'Выиграй свою первую битву', profile.wins >= 1, 'cup'],
+    ['Исследователь', 'Пройди первые шесть операций', profile.unlocked >= 7, 'map'],
+    ['Большая стратегия', 'Пройди двенадцать операций', profile.unlocked >= 13, 'game'],
+    ['Молниеносный захват', 'Заверши любую операцию менее чем за 2 минуты', Object.values(profile.best).some(n => n < 120), 'spark'],
+    ['Повелитель карты', 'Пройди все 24 операции', profile.best[24] !== undefined, 'cup']
+  ];
+  openModal('achievements', `<h2 class="modal-title">Каждая победа — история.</h2><p class="modal-description">Твои достижения в кампании. Продолжай играть, чтобы собрать их все.</p><div class="achievement-list">${achievements.map(([name, description, done, symbol]) => `<div class="achievement ${done ? 'unlocked' : ''}"><div class="medal">${icon(symbol)}</div><div><h3>${name}</h3><p>${description}</p></div><span>${done ? 'Получено' : icon('lock')}</span></div>`).join('')}</div>`, 'STATE.IO / ДОСТИЖЕНИЯ');
+}
+function openSettings() {
+  openModal('settings', `<h2 class="modal-title">Твой стиль игры.</h2><p class="modal-description">Настройки сохраняются вместе с кампанией.</p><label class="form-field">Сложность новых партий<select id="difficultySetting"><option value="easy" ${profile.settings.difficulty === 'easy' ? 'selected' : ''}>Лёгкая — время подумать</option><option value="normal" ${profile.settings.difficulty === 'normal' ? 'selected' : ''}>Обычная — равные силы</option><option value="hard" ${profile.settings.difficulty === 'hard' ? 'selected' : ''}>Сложная — быстрые соперники</option></select></label><div class="setting-row"><div><h3>Звуковые сигналы</h3><p>Отправка отрядов и победы</p></div><label class="toggle"><input id="soundSetting" type="checkbox" aria-label="Звуковые сигналы" ${profile.settings.sound ? 'checked' : ''}><span></span></label></div><div class="setting-row"><div><h3>Меньше анимации</h3><p>Отключить декоративные переходы</p></div><label class="toggle"><input id="motionSetting" type="checkbox" aria-label="Меньше анимации" ${profile.settings.reducedMotion ? 'checked' : ''}><span></span></label></div><p class="form-note">Изменение сложности применяется при запуске нового уровня.<br>Партия автоматически ставится на паузу, если ты уходишь с вкладки.</p><button class="primary-button full-width" data-action="save-settings">Сохранить настройки ${icon('check')}</button>`, 'STATE.IO / НАСТРОЙКИ');
+}
+function openHelp() {
+  openModal('help', `<h2 class="modal-title">Думай на шаг вперёд.</h2><p class="modal-description">Простое управление. Безграничная стратегия.</p><ol class="help-list"><li><h3>Собери свою армию</h3><p>На синих территориях автоматически появляются новые бойцы. Число в круге — размер гарнизона.</p></li><li><h3>Выбери цель</h3><p>Нажми на свою территорию, затем на цель. Или перетащи отряд от своей базы к другой земле. Ползунок определяет долю отправляемой армии.</p></li><li><h3>Расширяй границы</h3><p>Отряд больше гарнизона — территория твоя. На свои земли можно отправлять подкрепления. Серые земли не наращивают армию.</p></li><li><h3>Захвати всю карту</h3><p>Победи все армии соперников и открой следующую операцию. Пока у соперника есть отряды в пути, битва продолжается.</p></li></ol><div class="help-foot">Компьютер: Shift + нажатие выбирает несколько баз. Enter или пробел активируют территорию с клавиатуры. Пробел вне карты ставит игру на паузу. На телефоне работают нажатия и перетаскивание.</div>`, 'STATE.IO / КАК ИГРАТЬ');
+}
+function openResult() {
+  const won = game.status === 'won';
+  openModal('result', `<div class="result-hero">${icon(won ? 'cup' : 'restart')}</div><h2 class="modal-title">${won ? 'Эта карта — твоя.' : 'Битва окончена. Игра продолжается.'}</h2><p class="modal-description">${won ? game.level === TOTAL_LEVELS ? 'Все 24 операции позади. Твоя империя построена.' : 'Отличный ход. Следующая операция уже доступна.' : 'Попробуй другую стратегию: наращивай армию, захватывай свободные земли и защищай свою базу.'}</p><div class="result-stats"><div><strong>${formatTime(game.time)}</strong><span>Время битвы</span></div><div><strong>${String(game.level).padStart(2, '0')}</strong><span>Операция</span></div><div><strong>${profile.wins}</strong><span>Побед</span></div></div><div class="button-stack"><button class="primary-button" data-action="result-next">${won ? game.level === TOTAL_LEVELS ? 'Карта кампании' : 'Следующая операция' : 'Ещё одна попытка'} ${icon('arrow')}</button><button class="secondary-button" data-action="close">Посмотреть карту</button></div>`, won ? 'STATE.IO / ПОБЕДА' : 'STATE.IO / НОВЫЙ ШАНС');
+}
+function openConflict() {
+  openModal('conflict', `<h2 class="modal-title">Две партии. Один аккаунт.</h2><p class="modal-description">На другом устройстве появилось новое сохранение. Текущая партия остаётся на этом устройстве, пока ты не выберешь версию.</p><div class="button-stack"><button class="primary-button" data-action="use-cloud">Загрузить партию из аккаунта ${icon('cloud')}</button><button class="secondary-button" data-action="use-local">Заменить облачную партию текущей</button></div><p class="form-note">Замена сохранения затронет все устройства этого аккаунта.</p>`, 'STATE.IO / СИНХРОНИЗАЦИЯ');
+}
+async function resolveCloud(useLocal) {
+  const button = $('modalBody').querySelector(`[data-action="${useLocal ? 'use-local' : 'use-cloud'}"]`); if (button) button.disabled = true;
+  try {
+    const cloud = await api('save'); version = cloud.version; updatedAt = cloud.updatedAt;
+    if (!useLocal && cloud.save) { loadSnapshot(cloud.save); dirty = false; revision++; }
+    else markDirty();
+    conflict = false; localSave(); closeModal();
+    if (useLocal || !cloud.save) await saveCloud({ quiet: false });
+    else toast('Партия из аккаунта загружена');
+    syncLabel();
+  } catch (e) { toast(e.message); if (button) button.disabled = false; }
+}
+async function logout(offline = false) {
+  pauseGame();
+  if (!offline && dirty) {
+    const saved = await saveCloud({ quiet: false });
+    if (!saved) {
+      if (conflict) return openConflict();
+      return openModal('logout-warning', '<h2 class="modal-title">Прогресс пока на устройстве.</h2><p class="modal-description">Синхронизация недоступна. Если выйти сейчас, последние изменения останутся в этом браузере и будут предложены после следующего входа.</p><div class="button-stack"><button class="primary-button" data-action="logout-anyway">Выйти с локальным сохранением</button><button class="secondary-button" data-action="close">Остаться в аккаунте</button></div>');
+    }
+  }
+  try { await api('logout', { method: 'POST', body: '{}' }); }
+  catch { toast('Не удалось завершить серверную сессию. Проверь соединение.'); return; }
+  localSave(); user = null; version = 0; updatedAt = null; dirty = false; conflict = false; authUnknown = false; accountReady = false; syncError = false;
+  profile = DEFAULT_PROFILE(); game = createGame(); if (!loadLocal()) { buildMap(); render(); }
+  userUI(); syncLabel(); closeModal(); toast('Ты вышел из аккаунта');
+}
+document.addEventListener('click', e => {
+  const view = e.target.closest('[data-view]')?.dataset.view;
+  if (view) ({ game: () => { closeModal(); }, campaign: openCampaign, achievements: openAchievements, settings: openSettings, help: openHelp })[view]?.();
+});
+$('accountButton').addEventListener('click', openAccount); $('cloudButton').addEventListener('click', () => conflict ? openConflict() : openAccount());
+$('modalBody').addEventListener('click', async e => {
+  const levelButton = e.target.closest('[data-level]');
+  if (levelButton && !levelButton.disabled) {
+    const level = Number(levelButton.dataset.level);
+    if (level === game.level) { closeModal(); return; }
+    openModal('level-confirm', `<h2 class="modal-title">Операция ${String(level).padStart(2, '0')}.</h2><p class="modal-description">${titles[level - 1]}. Текущая партия будет заменена новой. Пройденные уровни сохранятся.</p><div class="button-stack"><button class="primary-button" data-action="change-level" data-target="${level}">Начать операцию ${icon('arrow')}</button><button class="secondary-button" data-action="campaign">Вернуться к кампании</button></div>`); return;
+  }
+  const button = e.target.closest('[data-action]'); if (!button) return;
+  const action = button.dataset.action;
+  if (action === 'login-tab') openAuth('login');
+  if (action === 'register-tab') openAuth('register');
+  if (action === 'close') closeModal();
+  if (action === 'campaign') openCampaign();
+  if (action === 'restart') { closeModal(); newLevel(game.level, true); }
+  if (action === 'change-level') { const level = Number(button.dataset.target); if (level <= profile.unlocked) { closeModal(); newLevel(level, true); } }
+  if (action === 'result-next') { closeModal(); startGame(); }
+  if (action === 'save-settings') {
+    profile.settings.difficulty = $('difficultySetting').value; profile.settings.sound = $('soundSetting').checked; profile.settings.reducedMotion = $('motionSetting').checked;
+    applySettings(); markDirty(); localSave(); closeModal(); void saveCloud(); toast('Настройки сохранены');
+  }
+  if (action === 'sync') { if (conflict) return openConflict(); button.disabled = true; await saveCloud({ quiet: false, force: true }); if (currentModal === 'account') openAccount(); }
+  if (action === 'reload-cloud') openModal('reload-confirm', '<h2 class="modal-title">Загрузить облачную партию?</h2><p class="modal-description">Текущая партия будет заменена последним сохранением аккаунта.</p><div class="button-stack"><button class="primary-button" data-action="use-cloud">Загрузить сохранение</button><button class="secondary-button" data-action="close">Отмена</button></div>');
+  if (action === 'use-cloud') { if (saving) await saving; await resolveCloud(false); }
+  if (action === 'use-local') {
+    openModal('conflict-confirm', '<h2 class="modal-title">Заменить облачную партию?</h2><p class="modal-description">Сохранение с другого устройства будет заменено текущей партией. Продолжить?</p><div class="button-stack"><button class="primary-button" data-action="confirm-local">Заменить сохранение</button><button class="secondary-button" data-action="conflict">Назад</button></div>');
+  }
+  if (action === 'confirm-local') { if (saving) await saving; await resolveCloud(true); }
+  if (action === 'conflict') openConflict();
+  if (action === 'logout') await logout();
+  if (action === 'logout-anyway') await logout(true);
+  if (action === 'transfer-guest') { markDirty(); closeModal(); await saveCloud({ quiet: false }); }
+  if (action === 'fresh-account') { profile = DEFAULT_PROFILE(); game = createGame(); buildMap(); render(); markDirty(); closeModal(); await saveCloud({ quiet: false }); }
+});
+$('modalBody').addEventListener('submit', async e => {
+  if (e.target.id !== 'authForm') return;
+  e.preventDefault(); const form = e.target, button = form.querySelector('[type="submit"]'); button.disabled = true;
+  $('authError').textContent = '';
+  try {
+    pauseGame(); const guestSave = snapshot();
+    const input = Object.fromEntries(new FormData(form));
+    const data = await api(form.dataset.mode === 'register' ? 'register' : 'login', { method: 'POST', body: JSON.stringify(input) });
+    const previousId = user?.id; accountReady = false; user = data.user; authUnknown = false; userUI();
+    const cloud = await api('save');
+    const local = (() => { try { return JSON.parse(localStorage.getItem(localKey())); } catch { return null; } })();
+    version = cloud.version; updatedAt = cloud.updatedAt; dirty = false; conflict = false; accountReady = true; syncError = false;
+    if (cloud.save) {
+      if (local?.save && local.dirty && JSON.stringify(local.save) !== JSON.stringify(cloud.save)) {
+        loadSnapshot(local.save); markDirty();
+        if (local.version !== cloud.version) { conflict = true; openConflict(); }
+        else { closeModal(); await saveCloud({ quiet: false }); }
+      }
+      else { loadSnapshot(cloud.save); closeModal(); toast('С возвращением! Твоя партия загружена.'); }
+    } else if (!previousId && (guestSave.game.time > 0 || guestSave.profile.wins > 0)) {
+      openModal('transfer', '<h2 class="modal-title">Продолжим твою кампанию?</h2><p class="modal-description">У тебя есть гостевая партия. Перенеси её в аккаунт, чтобы продолжить на другом устройстве.</p><div class="button-stack"><button class="primary-button" data-action="transfer-guest">Перенести гостевой прогресс</button><button class="secondary-button" data-action="fresh-account">Начать новую кампанию</button></div>');
+    } else { profile = DEFAULT_PROFILE(); game = createGame(); buildMap(); render(); markDirty(); closeModal(); await saveCloud(); toast('Аккаунт готов. Удачной битвы!'); }
+    localSave(); syncLabel();
+  } catch (e) { if ($('authError')) $('authError').textContent = e.message; else toast(e.message); button.disabled = false; }
+});
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !$('modal').open && !e.target.closest('input,button,select,[data-node]')) { e.preventDefault(); if (game.status === 'playing') { pauseGame(); void saveCloud(); } else startGame(); }
+});
+document.addEventListener('visibilitychange', () => { if (document.hidden) { pauseGame(); localSave(); void saveCloud(); } });
+window.addEventListener('pagehide', () => { pauseGame(); localSave(); });
+window.addEventListener('beforeunload', e => { localSave(); if (user && dirty && game.time > 0) { e.preventDefault(); e.returnValue = ''; } });
+window.addEventListener('online', () => { authUnknown ? void initializeAccount() : void saveCloud(); });
+window.addEventListener('offline', syncLabel);
+matchMedia('(max-width:650px)').addEventListener('change', e => { portrait = e.matches; buildMap(); render(); });
+setInterval(() => { localSave(); void saveCloud(); }, 15000);
+function frame(now) {
+  const dt = lastFrame ? Math.min((now - lastFrame) / 1000, .1) : 0; lastFrame = now;
+  if (game.status === 'playing' && !$('modal').open && !document.hidden) {
+    step(game, dt); markDirty();
+    if (now - lastRender > 60) { render(); lastRender = now; }
+    if (['won', 'lost'].includes(game.status) && !resultShown) {
+      recordResult(profile, game); resultShown = true; markDirty(); localSave(); void saveCloud(); if (game.status === 'won') sound('win'); openResult();
+    }
+  }
+  requestAnimationFrame(frame);
+}
+try { const remembered = JSON.parse(localStorage.getItem('stateio.lastUser')); if (remembered && typeof remembered.id === 'string' && typeof remembered.name === 'string' && typeof remembered.email === 'string') { user = remembered; authUnknown = true; } } catch { /* Start as guest. */ }
+buildMap(); if (!loadLocal()) render(); applySettings(); userUI();
+void initializeAccount(); requestAnimationFrame(frame);
